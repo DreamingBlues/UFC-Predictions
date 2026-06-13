@@ -31,6 +31,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -50,6 +51,14 @@ BASE_COLUMNS = [
     "winner",
     "R_fighter",
     "B_fighter",
+    "R_DOB",
+    "B_DOB",
+    "R_Height",
+    "B_Height",
+    "R_Reach",
+    "B_Reach",
+    "R_Stance",
+    "B_Stance",
     "R_status",
     "B_status",
     "win_by",
@@ -313,6 +322,8 @@ def parse_people(fight_soup: BeautifulSoup) -> Dict[str, str]:
     out = {
         "R_fighter": "",
         "B_fighter": "",
+        "R_fighter_url": "",
+        "B_fighter_url": "",
         "R_status": "",
         "B_status": "",
         "winner": "",
@@ -322,16 +333,103 @@ def parse_people(fight_soup: BeautifulSoup) -> Dict[str, str]:
     for idx, person in enumerate(people[:2]):
         side = "R" if idx == 0 else "B"
         name_el = person.select_one("h3.b-fight-details__person-name")
+        link_el = person.select_one("a[href*='/fighter-details/']")
         status_el = person.select_one("i.b-fight-details__person-status")
         name = clean_text(name_el.get_text(" ", strip=True)) if name_el else ""
+        fighter_url = clean_text(link_el.get("href", "")) if link_el else ""
         status = clean_text(status_el.get_text(" ", strip=True)) if status_el else ""
 
         out[f"{side}_fighter"] = name
+        out[f"{side}_fighter_url"] = fighter_url
         out[f"{side}_status"] = status
         if status.upper() == "W":
             out["winner"] = name
 
     return out
+
+
+def empty_fighter_profile() -> Dict[str, str]:
+    return {
+        "DOB": "",
+        "Height": "",
+        "Reach": "",
+        "Stance": "",
+    }
+
+
+def parse_fighter_profile(fighter_soup: BeautifulSoup) -> Dict[str, str]:
+    profile = empty_fighter_profile()
+    label_to_field = {
+        "dob": "DOB",
+        "height": "Height",
+        "reach": "Reach",
+        "stance": "Stance",
+    }
+
+    for item in fighter_soup.select("li.b-list__box-list-item"):
+        label = item.select_one("i.b-list__box-item-title")
+        if label is None:
+            continue
+
+        label_text = clean_text(label.get_text(" ", strip=True)).rstrip(":").lower()
+        field = label_to_field.get(label_text)
+        if field is None:
+            continue
+
+        value = clean_text(item.get_text(" ", strip=True))
+        label_value = clean_text(label.get_text(" ", strip=True))
+        profile[field] = clean_text(value.replace(label_value, "", 1))
+
+    return profile
+
+
+def get_cached_fighter_profile(
+    client: UFCStatsClient,
+    fighter_url: str,
+    fighter_name: str,
+    fighter_profile_cache: Dict[str, Dict[str, str]],
+    fighter_profile_lock: Lock,
+) -> Dict[str, str]:
+    if not fighter_url:
+        return empty_fighter_profile()
+
+    with fighter_profile_lock:
+        cached_profile = fighter_profile_cache.get(fighter_url)
+        if cached_profile is not None:
+            return cached_profile.copy()
+
+    try:
+        fighter_soup = client.soup(fighter_url)
+        profile = parse_fighter_profile(fighter_soup)
+    except Exception as exc:
+        print(f"  WARNING profile lookup failed for {fighter_name} ({fighter_url}): {exc}", file=sys.stderr)
+        profile = empty_fighter_profile()
+
+    with fighter_profile_lock:
+        existing_profile = fighter_profile_cache.get(fighter_url)
+        if existing_profile is not None:
+            return existing_profile.copy()
+        fighter_profile_cache[fighter_url] = profile
+
+    return profile.copy()
+
+
+def add_fighter_profiles(
+    row: Dict[str, object],
+    client: UFCStatsClient,
+    fighter_profile_cache: Dict[str, Dict[str, str]],
+    fighter_profile_lock: Lock,
+) -> None:
+    for side in ("R", "B"):
+        profile = get_cached_fighter_profile(
+            client=client,
+            fighter_url=str(row.get(f"{side}_fighter_url", "")),
+            fighter_name=str(row.get(f"{side}_fighter", "")),
+            fighter_profile_cache=fighter_profile_cache,
+            fighter_profile_lock=fighter_profile_lock,
+        )
+        for field, value in profile.items():
+            row[f"{side}_{field}"] = value
 
 
 def parse_fight_meta(fight_soup: BeautifulSoup) -> Dict[str, str]:
@@ -458,9 +556,17 @@ def parse_fight_page(fight_soup: BeautifulSoup, fight_url: str, event_info: Dict
     return row
 
 
-def scrape_one_fight(client: UFCStatsClient, fight_url: str, event_info: Dict[str, str]) -> Dict[str, object]:
+def scrape_one_fight(
+    client: UFCStatsClient,
+    fight_url: str,
+    event_info: Dict[str, str],
+    fighter_profile_cache: Dict[str, Dict[str, str]],
+    fighter_profile_lock: Lock,
+) -> Dict[str, object]:
     fight_soup = client.soup(fight_url)
-    return parse_fight_page(fight_soup, fight_url, event_info)
+    row = parse_fight_page(fight_soup, fight_url, event_info)
+    add_fighter_profiles(row, client, fighter_profile_cache, fighter_profile_lock)
+    return row
 
 
 def scrape_all_fights(
@@ -481,6 +587,8 @@ def scrape_all_fights(
 
     total_written = 0
     failures: List[Dict[str, str]] = []
+    fighter_profile_cache: Dict[str, Dict[str, str]] = {}
+    fighter_profile_lock = Lock()
 
     try:
         print("Getting completed event links...")
@@ -514,7 +622,13 @@ def scrape_all_fights(
                 if workers <= 1:
                     for fight_url in fight_links:
                         try:
-                            row = scrape_one_fight(client, fight_url, event_info)
+                            row = scrape_one_fight(
+                                client,
+                                fight_url,
+                                event_info,
+                                fighter_profile_cache,
+                                fighter_profile_lock,
+                            )
                             writer.writerow(row)
                             total_written += 1
                         except Exception as exc:
@@ -523,7 +637,14 @@ def scrape_all_fights(
                 else:
                     with ThreadPoolExecutor(max_workers=workers) as executor:
                         future_to_url = {
-                            executor.submit(scrape_one_fight, client, fight_url, event_info): fight_url
+                            executor.submit(
+                                scrape_one_fight,
+                                client,
+                                fight_url,
+                                event_info,
+                                fighter_profile_cache,
+                                fighter_profile_lock,
+                            ): fight_url
                             for fight_url in fight_links
                         }
                         for future in as_completed(future_to_url):
@@ -538,6 +659,7 @@ def scrape_all_fights(
 
                 f.flush()
                 print(f"  Total fights written: {total_written}")
+                print(f"  Fighter profiles cached: {len(fighter_profile_cache)}")
 
     finally:
         client.close()
@@ -554,7 +676,7 @@ def scrape_all_fights(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape all UFCStats fight statistics into CSV.")
-    parser.add_argument("--out", type=Path, default=Path("data/ufc_fights.csv"), help="Output CSV path.")
+    parser.add_argument("--out", type=Path, default=Path("data_raw/ufc_fights.csv"), help="Output CSV path.")
     parser.add_argument("--headless", action="store_true", help="Run Chromium without showing the browser window.")
     parser.add_argument("--browser-only", action="store_true", help="Use Playwright for every page. Slower, but useful if cookies do not work with requests.")
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel fight-page requests in hybrid mode.")
