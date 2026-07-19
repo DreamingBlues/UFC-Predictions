@@ -31,7 +31,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from threading import Lock
+from typing import Dict, Iterable, List, Optional, Tuple, Set
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -50,6 +52,14 @@ BASE_COLUMNS = [
     "winner",
     "R_fighter",
     "B_fighter",
+    "R_DOB",
+    "B_DOB",
+    "R_Height",
+    "B_Height",
+    "R_Reach",
+    "B_Reach",
+    "R_Stance",
+    "B_Stance",
     "R_status",
     "B_status",
     "win_by",
@@ -313,6 +323,8 @@ def parse_people(fight_soup: BeautifulSoup) -> Dict[str, str]:
     out = {
         "R_fighter": "",
         "B_fighter": "",
+        "R_fighter_url": "",
+        "B_fighter_url": "",
         "R_status": "",
         "B_status": "",
         "winner": "",
@@ -322,17 +334,117 @@ def parse_people(fight_soup: BeautifulSoup) -> Dict[str, str]:
     for idx, person in enumerate(people[:2]):
         side = "R" if idx == 0 else "B"
         name_el = person.select_one("h3.b-fight-details__person-name")
+        link_el = person.select_one("a[href*='/fighter-details/']")
         status_el = person.select_one("i.b-fight-details__person-status")
         name = clean_text(name_el.get_text(" ", strip=True)) if name_el else ""
+        fighter_url = clean_text(link_el.get("href", "")) if link_el else ""
         status = clean_text(status_el.get_text(" ", strip=True)) if status_el else ""
 
         out[f"{side}_fighter"] = name
+        out[f"{side}_fighter_url"] = fighter_url
         out[f"{side}_status"] = status
         if status.upper() == "W":
             out["winner"] = name
 
     return out
 
+
+def empty_fighter_profile() -> Dict[str, str]:
+    return {
+        "DOB": "",
+        "Height": "",
+        "Reach": "",
+        "Stance": "",
+    }
+
+
+def parse_fighter_profile(fighter_soup: BeautifulSoup) -> Dict[str, str]:
+    profile = empty_fighter_profile()
+    label_to_field = {
+        "dob": "DOB",
+        "height": "Height",
+        "reach": "Reach",
+        "stance": "Stance",
+    }
+
+    for item in fighter_soup.select("li.b-list__box-list-item"):
+        label = item.select_one("i.b-list__box-item-title")
+        if label is None:
+            continue
+
+        label_text = clean_text(label.get_text(" ", strip=True)).rstrip(":").lower()
+        field = label_to_field.get(label_text)
+        if field is None:
+            continue
+
+        value = clean_text(item.get_text(" ", strip=True))
+        label_value = clean_text(label.get_text(" ", strip=True))
+        profile[field] = clean_text(value.replace(label_value, "", 1))
+
+    return profile
+
+
+def get_cached_fighter_profile(
+    client: UFCStatsClient,
+    fighter_url: str,
+    fighter_name: str,
+    fighter_profile_cache: Dict[str, Dict[str, str]],
+    fighter_profile_lock: Lock,
+) -> Dict[str, str]:
+    if not fighter_url:
+        return empty_fighter_profile()
+
+    with fighter_profile_lock:
+        cached_profile = fighter_profile_cache.get(fighter_url)
+        if cached_profile is not None:
+            return cached_profile.copy()
+
+    try:
+        fighter_soup = client.soup(fighter_url)
+        profile = parse_fighter_profile(fighter_soup)
+    except Exception as exc:
+        print(f"  WARNING profile lookup failed for {fighter_name} ({fighter_url}): {exc}", file=sys.stderr)
+        profile = empty_fighter_profile()
+
+    with fighter_profile_lock:
+        existing_profile = fighter_profile_cache.get(fighter_url)
+        if existing_profile is not None:
+            return existing_profile.copy()
+        fighter_profile_cache[fighter_url] = profile
+
+    return profile.copy()
+
+
+def add_fighter_profiles(
+    row: Dict[str, object],
+    client: UFCStatsClient,
+    fighter_profile_cache: Dict[str, Dict[str, str]],
+    fighter_profile_lock: Lock,
+) -> None:
+    for side in ("R", "B"):
+        profile = get_cached_fighter_profile(
+            client=client,
+            fighter_url=str(row.get(f"{side}_fighter_url", "")),
+            fighter_name=str(row.get(f"{side}_fighter", "")),
+            fighter_profile_cache=fighter_profile_cache,
+            fighter_profile_lock=fighter_profile_lock,
+        )
+        for field, value in profile.items():
+            row[f"{side}_{field}"] = value
+
+def sort_csv_by_date(out_path: Path) -> None:
+    with out_path.open("r", newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    rows.sort(
+        key=lambda row: datetime.strptime(row["date"], "%B %d, %Y"),
+        reverse=True,
+    )
+
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 def parse_fight_meta(fight_soup: BeautifulSoup) -> Dict[str, str]:
     out = {
@@ -458,11 +570,39 @@ def parse_fight_page(fight_soup: BeautifulSoup, fight_url: str, event_info: Dict
     return row
 
 
-def scrape_one_fight(client: UFCStatsClient, fight_url: str, event_info: Dict[str, str]) -> Dict[str, object]:
+def scrape_one_fight(
+    client: UFCStatsClient,
+    fight_url: str,
+    event_info: Dict[str, str],
+    fighter_profile_cache: Dict[str, Dict[str, str]],
+    fighter_profile_lock: Lock,
+) -> Dict[str, object]:
     fight_soup = client.soup(fight_url)
-    return parse_fight_page(fight_soup, fight_url, event_info)
+    row = parse_fight_page(fight_soup, fight_url, event_info)
+    add_fighter_profiles(row, client, fighter_profile_cache, fighter_profile_lock)
+    return row
 
 
+def load_existing_fight_urls(out_path: Path) -> Set[str]:
+    """Load fight URLs already stored in the output CSV."""
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return set()
+
+    with out_path.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+
+        if not reader.fieldnames or "fight_url" not in reader.fieldnames:
+            raise ValueError(
+                f"Existing CSV {out_path} does not contain a fight_url column."
+            )
+
+        return {
+            clean_text(row.get("fight_url", ""))
+            for row in reader
+            if clean_text(row.get("fight_url", ""))
+        }
+    
 def scrape_all_fights(
     out_path: Path,
     headless: bool,
@@ -475,12 +615,24 @@ def scrape_all_fights(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     failed_path = out_path.with_suffix(".failed.csv")
 
+    existing_fight_urls = load_existing_fight_urls(out_path)
+    output_exists = out_path.exists() and out_path.stat().st_size > 0
+
+    if existing_fight_urls:
+        print(f"Loaded {len(existing_fight_urls)} existing fights.")
+    else:
+        print("No existing fights found; starting a new scrape.")
+
     client = UFCStatsClient(headless=headless, browser_only=browser_only, delay=delay)
     if browser_only:
         workers = 1
 
     total_written = 0
+    total_skipped = 0
+
     failures: List[Dict[str, str]] = []
+    fighter_profile_cache: Dict[str, Dict[str, str]] = {}
+    fighter_profile_lock = Lock()
 
     try:
         print("Getting completed event links...")
@@ -494,28 +646,87 @@ def scrape_all_fights(
 
         print(f"Found {len(event_links)} events.")
 
-        with out_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
-            writer.writeheader()
+        mode = "a" if output_exists else "w"
+
+        with out_path.open(mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=FIELDNAMES,
+                extrasaction="ignore",
+            )
+
+            if not output_exists:
+                writer.writeheader()
 
             for event_index, event_url in enumerate(event_links, start=1):
                 print(f"[{event_index}/{len(event_links)}] Event: {event_url}")
                 event_soup = client.soup(event_url)
                 event_info = parse_event_info(event_soup, event_url)
-                fight_links = extract_fight_links(event_soup)
+
+
+                all_fight_links = extract_fight_links(event_soup)
+
+                print(f"  Found {len(all_fight_links)} fights on the card.")
+
+                if not all_fight_links:
+                    failures.append(
+                        {
+                            "event_url": event_url,
+                            "fight_url": "",
+                            "error": "No fight links found",
+                        }
+                    )
+                    continue
+
+                # Completed events are listed newest to oldest.
+                # If this entire event is already stored, assume older events are complete.
+                event_is_complete = all(
+                    fight_url in existing_fight_urls
+                    for fight_url in all_fight_links
+                )
+
+                if event_is_complete:
+                    print(
+                        f"  All {len(all_fight_links)} fights from this event "
+                        "already exist. Stopping."
+                    )
+                    break
+
+                fight_links = all_fight_links
+
                 if limit_fights is not None:
                     fight_links = fight_links[:limit_fights]
 
-                print(f"  Found {len(fight_links)} fights.")
-                if not fight_links:
-                    failures.append({"event_url": event_url, "fight_url": "", "error": "No fight links found"})
+                missing_fight_links = [
+                    fight_url
+                    for fight_url in fight_links
+                    if fight_url not in existing_fight_urls
+                ]
+
+                skipped_for_event = len(fight_links) - len(missing_fight_links)
+                total_skipped += skipped_for_event
+
+                if skipped_for_event:
+                    print(f"  Skipping {skipped_for_event} existing fights.")
+
+                print(f"  Scraping {len(missing_fight_links)} missing fights.")
+
+                if not missing_fight_links:
                     continue
 
                 if workers <= 1:
-                    for fight_url in fight_links:
+                    for fight_url in missing_fight_links:
                         try:
-                            row = scrape_one_fight(client, fight_url, event_info)
+                            row = scrape_one_fight(
+                                client,
+                                fight_url,
+                                event_info,
+                                fighter_profile_cache,
+                                fighter_profile_lock,
+                            )
                             writer.writerow(row)
+                            existing_fight_urls.add(fight_url)
+
                             total_written += 1
                         except Exception as exc:
                             print(f"  FAILED fight {fight_url}: {exc}", file=sys.stderr)
@@ -523,21 +734,32 @@ def scrape_all_fights(
                 else:
                     with ThreadPoolExecutor(max_workers=workers) as executor:
                         future_to_url = {
-                            executor.submit(scrape_one_fight, client, fight_url, event_info): fight_url
-                            for fight_url in fight_links
+                            executor.submit(
+                                scrape_one_fight,
+                                client,
+                                fight_url,
+                                event_info,
+                                fighter_profile_cache,
+                                fighter_profile_lock,
+                            ): fight_url
+                            for fight_url in missing_fight_links
                         }
                         for future in as_completed(future_to_url):
                             fight_url = future_to_url[future]
                             try:
                                 row = future.result()
                                 writer.writerow(row)
+                                existing_fight_urls.add(fight_url)
                                 total_written += 1
                             except Exception as exc:
                                 print(f"  FAILED fight {fight_url}: {exc}", file=sys.stderr)
                                 failures.append({"event_url": event_url, "fight_url": fight_url, "error": str(exc)})
 
                 f.flush()
-                print(f"  Total fights written: {total_written}")
+                print(f"  New fights written this run: {total_written}")
+                print(f"  Existing fights skipped: {total_skipped}")
+                
+                print(f"  Fighter profiles cached: {len(fighter_profile_cache)}")
 
     finally:
         client.close()
@@ -549,12 +771,16 @@ def scrape_all_fights(
             writer.writerows(failures)
         print(f"Finished with {len(failures)} failures. See: {failed_path}", file=sys.stderr)
 
-    print(f"Done. Wrote {total_written} fights to {out_path}")
-
+    sort_csv_by_date(out_path)
+    
+    print(
+        f"Done. Added {total_written} new fights to {out_path}; "
+        f"skipped {total_skipped} existing fights."
+    )
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape all UFCStats fight statistics into CSV.")
-    parser.add_argument("--out", type=Path, default=Path("data/ufc_fights.csv"), help="Output CSV path.")
+    parser.add_argument("--out", type=Path, default=Path("data_raw/ufc_fights.csv"), help="Output CSV path.")
     parser.add_argument("--headless", action="store_true", help="Run Chromium without showing the browser window.")
     parser.add_argument("--browser-only", action="store_true", help="Use Playwright for every page. Slower, but useful if cookies do not work with requests.")
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel fight-page requests in hybrid mode.")
