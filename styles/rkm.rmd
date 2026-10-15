@@ -265,3 +265,10 @@ best_result <- results_table[which.max(results_table$silhouette_score), ]
 best_result
 ```
 
+
+- how RKM differs from PCA followed by K-means
+- why the joint optimization may be useful here
+- how the reduced dimension is selected
+- what assumptions the method makes
+
+The most important deliverable is a small comparison table showing preprocessing choice, nclus, ndim, average silhouette, stability, ARI, and cluster sizes. This will help decide whether the apparent three-cluster solution is a real pattern or just an artifact of the preliminary preprocessing.
