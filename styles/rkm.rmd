@@ -1,0 +1,267 @@
+---
+title: "Fighter Style Clustering"
+output: html_document
+---
+
+This report prepares fighter career statistics, runs reduced K-means clustering, and saves one cluster label for each fighter.
+
+```{r setup, message=FALSE, warning=FALSE}
+
+
+library(clustrd)
+
+set.seed(123)
+
+# Find the folder containing this R Markdown file.
+# This makes relative paths work whether the file is knitted or run manually.
+rmd_path <- knitr::current_input(dir = TRUE)
+
+if (is.null(rmd_path) || !nzchar(rmd_path)) {
+  rmd_dir <- if (dir.exists(file.path(getwd(), "styles"))) {
+    file.path(getwd(), "styles")
+  } else {
+    getwd()
+  }
+} else {
+  rmd_dir <- dirname(normalizePath(rmd_path, mustWork = TRUE))
+}
+
+# Evaluate later chunks from the R Markdown file's folder.
+knitr::opts_knit$set(root.dir = rmd_dir)
+
+data_path <- file.path("..", "data_clean", "fighter_career_stats.csv")
+output_path <- "clusters3_redo.csv"
+
+if (!file.exists(data_path)) {
+  stop("Could not find data_clean/fighter_career_stats.csv")
+}
+```
+
+## Load the data
+
+This block reads the fighter-level dataset and separates fighter names from the variables used for clustering.
+
+```{r load-data}
+fighter_data <- read.csv(
+  data_path,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+fighter_names <- fighter_data$fighter
+
+# Use columns 3 through 56 as the clustering variables.
+# The first two columns are the fighter name and total fight count.
+cluster_data <- fighter_data[, 3:56, drop = FALSE]
+
+cat("Fighters:", nrow(cluster_data), "\n")
+cat("Clustering variables:", ncol(cluster_data), "\n")
+```
+
+## Prepare the clustering variables
+
+This block checks for missing values and replaces them with the mean of their respective variable. The optional TD_def switch allows that variable to be removed instead.
+
+```{r prepare-data}
+missing_before <- colSums(is.na(cluster_data))
+missing_before[missing_before > 0]
+
+# Keep FALSE for mean imputation.
+# Change to TRUE to remove TD_def before clustering.
+remove_td_def <- FALSE
+
+if (remove_td_def && "TD_def" %in% names(cluster_data)) {
+  cluster_data$TD_def <- NULL
+}
+
+# Replace each missing value with that variable's observed mean.
+for (column_name in names(cluster_data)) {
+  column_mean <- mean(cluster_data[[column_name]], na.rm = TRUE)
+
+  if (is.nan(column_mean)) {
+    stop(sprintf("Cannot impute %s because it has no observed values.", column_name))
+  }
+
+  missing_values <- is.na(cluster_data[[column_name]])
+  cluster_data[[column_name]][missing_values] <- column_mean
+}
+
+stopifnot(!anyNA(cluster_data))
+
+cat("Variables used:", ncol(cluster_data), "\n")
+cat("Missing values remaining:", sum(is.na(cluster_data)), "\n")
+```
+
+## Fit the clustering model
+
+This block runs reduced K-means. The variables are centered and scaled so that variables with larger numeric units do not dominate the analysis.
+
+```{r reduced-k-means}
+rkm_fit <- clustrd::cluspca(
+  data = cluster_data,
+  nclus = 3,
+  ndim = 6,
+  method = "RKM",
+  center = TRUE,
+  scale = TRUE,
+  nstart = 100,
+  seed = 123
+)
+
+summary(rkm_fit)
+```
+
+## Save cluster labels
+
+This block attaches the cluster assignment to each fighter and writes the result to a CSV file.
+
+```{r export-clusters}
+cluster_labels <- as.integer(rkm_fit$cluster)
+
+clusters3_redo <- data.frame(
+  fighter = fighter_names,
+  cluster = cluster_labels
+)
+
+write.csv(
+  clusters3_redo,
+  file = output_path,
+  row.names = FALSE
+)
+
+cat("Saved:", normalizePath(output_path, mustWork = FALSE), "\n")
+print(table(clusters3_redo$cluster))
+head(clusters3_redo)
+```
+
+## Summarize cluster profiles
+
+This final block calculates the average value of every clustering variable within each cluster. It helps describe how the clusters differ.
+
+```{r cluster-profile}
+cluster_profile <- aggregate(
+  cluster_data,
+  by = list(cluster = clusters3_redo$cluster),
+  FUN = mean
+)
+
+cluster_profile
+```
+
+## Run Comparison of hyperparameters
+
+Testing out the different values for clusters and reduced dimensions, to see how silhouette score changes. 
+
+```{r}
+library(cluster)
+library(mclust)
+
+nclus = 3:6
+ndim = 4:7
+
+evaluate_rkm <- function(nclus, ndim) {
+  fit <- clustrd::cluspca(
+    data = cluster_data,
+    nclus = nclus,
+    ndim = ndim,
+    method = "RKM",
+    center = TRUE,
+    scale = TRUE,
+    nstart = 100,
+    seed = 123
+  )
+
+  labels <- as.integer(fit$cluster)
+  coordinates <- as.matrix(fit$obscoord)
+
+  silhouette_score <- mean(
+    cluster::silhouette(labels, dist(coordinates))[, "sil_width"]
+  )
+
+  cluster_sizes <- table(labels)
+
+  list(
+    fit = fit,
+    labels = labels,
+    silhouette = silhouette_score,
+    cluster_sizes = cluster_sizes
+  )
+}
+
+
+# Create every nclus/ndim combination.
+settings <- expand.grid(
+  nclus = 3:6,
+  ndim = 4:7
+)
+
+models <- vector("list", nrow(settings))
+results <- vector("list", nrow(settings))
+
+for (i in seq_len(nrow(settings))) {
+  current_nclus <- settings$nclus[i]
+  current_ndim <- settings$ndim[i]
+
+  evaluation <- evaluate_rkm(
+    nclus = current_nclus,
+    ndim = current_ndim
+  )
+
+  models[[i]] <- evaluation$fit
+
+  sizes <- evaluation$cluster_sizes
+
+  results[[i]] <- data.frame(
+    nclus = current_nclus,
+    ndim = current_ndim,
+    silhouette_score = evaluation$silhouette,
+    cluster_sizes = paste(
+      paste0("Cluster ", names(sizes), " = ", as.integer(sizes)),
+      collapse = ", "
+    )
+  )
+}
+
+# Combine all results and rank them by silhouette score.
+results_table <- do.call(rbind, results)
+results_table <- results_table[
+  order(-results_table$silhouette_score),
+]
+
+rownames(results_table) <- NULL
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(
+  results_table,
+  aes(
+    x = factor(ndim),
+    y = factor(nclus),
+    fill = silhouette_score
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.3f", silhouette_score)),
+    color = "black",
+    size = 4
+  ) +
+  scale_fill_viridis_c(
+    option = "C",
+    name = "Silhouette\nscore"
+  ) +
+  labs(
+    title = "RKM Silhouette Scores",
+    subtitle = "Comparison across cluster counts and reduced dimensions",
+    x = "Number of reduced dimensions",
+    y = "Number of clusters"
+  ) +
+  theme_minimal(base_size = 13)
+
+best_result <- results_table[which.max(results_table$silhouette_score), ]
+
+best_result
+```
+
